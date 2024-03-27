@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+
+import boto3, argparse, os
+
+parser = argparse.ArgumentParser(prog='protect-stack',
+                                 description='protect or unprotect a stack and all nodes',
+                                 epilog="USE AT YOUR OWN RISK!!!")
+
+parser.add_argument('stackname')
+parser.add_argument('-u', '--unprotect', help='Disable protections', action='store_true')
+parser.add_argument('-t', '--stack-termination', help='Set/clear stack termination protection', action='store_true')
+parser.add_argument('-i', '--instance-termination', help='Set/clear instance terminationprotection', action='store_true')
+parser.add_argument('-s', '--instance-stop', help='Set/clear stack termination', action='store_true')
+parser.add_argument('--all', help='Set/clear all protections!', action='store_true')
+parser.add_argument('--really', help='Really take action.  Dry run if this is not set.', action='store_true')
+parser.add_argument('-r','--region', help='AWS region to operate on', default=os.getenv("AWS_REGION"), action='store_true')
+
+a = parser.parse_args()
+if a.all:
+   a.stack_termination=True
+   a.instance_termination=True
+   a.instance_stop=True
+
+print(f'Stack {a.stackname}')
+print(f'Region {a.region}')
+print(f'Stack Termination:  {a.stack_termination}')
+print(f'Instance Termination:  {a.instance_termination}')
+print(f'Instance Stop:  {a.instance_stop}')
+print(f'Unprotect:  {a.unprotect}')
+print(f'Write Changes:  {a.really}')
+
+print("\nCollecting Data")
+
+ec2 = boto3.client('ec2', region_name=a.region)
+cft = boto3.client('cloudformation', region_name=a.region)
+
+stacks = cft.describe_stacks(StackName=a.stackname)
+
+if len(stacks["Stacks"]) != 1:
+   die("Incorrect response while listing stacks.")
+
+stk=stacks["Stacks"][0]
+print(f"Stack ID:  {stk["StackId"]}")
+print(f"Status:  {stk["StackStatus"]}")
+stprot=stk["EnableTerminationProtection"]
+print(f"Termination Protection:  {stprot}")
+
+stackres=cft.describe_stack_resources(StackName=a.stackname)
+
+instance_list=[]
+itprot={}
+isprot={}
+
+def handle_instance(instance_id):
+    instance_list.append(instance_id)
+    apiterm=ec2.describe_instance_attribute(Attribute="disableApiTermination", InstanceId=instance_id)['DisableApiTermination']['Value']
+    apistop=ec2.describe_instance_attribute(Attribute="disableApiStop", InstanceId=instance_id)['DisableApiStop']['Value']
+    itprot[instance_id]=apiterm
+    isprot[instance_id]=apistop
+    print(f"Found instance {instance_id} - {r["LogicalResourceId"]} Termination Protection: {apiterm} Stop Protection: {apistop}")
+
+
+for r in stackres["StackResources"]:
+    if r["StackName"] != a.stackname:
+       die("WTF?!  Sanity check failed.  I am insane!")
+       
+    if r["ResourceType"] == "AWS::EC2::Instance":
+       handle_instance(r["PhysicalResourceId"])
+
+    if r["ResourceType"] == "Custom::EC2Instances":
+       for iid in r["PhysicalResourceId"].split(":"):
+          handle_instance(iid)
+
+if a.unprotect:
+   op="Clearing"
+else:
+   op="Setting"
+       
+if a.stack_termination or a.instance_termination or a.instance_stop:
+   if not a.really:
+      print("DRY RUN -- NOTHING WILL BE CHANGED.\nRun with --really to really change things")
+   
+   if a.stack_termination and stprot == a.unprotect:
+      print(f"{op} termination protection on stack {a.stackname}")
+      if a.really:
+         cft.update_termination_protection(StackName=a.stackname, EnableTerminationProtection=not stprot)
+
+   for i in instance_list:
+      if a.instance_termination and itprot[i] == a.unprotect:
+         print(f"{op} termination protection on instance {i}")
+         if a.really:
+            ec2.modify_instance_attribute(InstanceId=i, DisableApiTermination={"Value": not itprot[i]})
+
+      if a.instance_stop and isprot[i] == a.unprotect:
+         print(f"{op} stop protection on instance {i}")
+         if a.really:
+            ec2.modify_instance_attribute(InstanceId=i, DisableApiStop={"Value": not isprot[i]})
+
+      
+       
